@@ -26,11 +26,7 @@ Next, your python :code:`path` can be fetched with the following commands:
 
     # If redbot is installed in a venv
     $ source ~/redenv/bin/activate
-    (redenv) $ which python
-
-    # If redbot is installed in a pyenv virtualenv
-    $ pyenv shell <virtualenv_name>
-    (redenv) $ pyenv which python
+    (redenv) $ /usr/bin/which python
 
 Then create the new service file:
 
@@ -52,9 +48,10 @@ Paste the following in the file, and replace all instances of :code:`username` w
     User=username
     Group=username
     Type=idle
-    Restart=always
+    Restart=on-abnormal
     RestartSec=15
-    RestartPreventExitStatus=0
+    RestartForceExitStatus=1
+    RestartForceExitStatus=26
     TimeoutStopSec=10
 
     [Install]

@@ -1,6 +1,7 @@
 import discord
+from redbot.core.utils.chat_formatting import humanize_list
 from redbot.core.bot import Red
-from redbot.core import checks, commands, Config
+from redbot.core import commands, Config
 from redbot.core.i18n import cog_i18n, Translator, set_contextual_locales_from_guild
 from redbot.core.utils._internal_utils import send_to_owners_with_prefix_replaced
 from redbot.core.utils.chat_formatting import escape, inline, pagify
@@ -60,6 +61,7 @@ class Streams(commands.Cog):
         "live_message_nomention": False,
         "ignore_reruns": False,
         "ignore_schedule": False,
+        "use_buttons": False,
     }
 
     role_defaults = {"mention": False}
@@ -79,11 +81,8 @@ class Streams(commands.Cog):
 
         self.yt_cid_pattern = re.compile("^UC[-_A-Za-z0-9]{21}[AQgw]$")
 
-        self._ready_event: asyncio.Event = asyncio.Event()
-        self._init_task: asyncio.Task = self.bot.loop.create_task(self.initialize())
-
     async def red_delete_data_for_user(self, **kwargs):
-        """ Nothing to delete """
+        """Nothing to delete"""
         return
 
     def check_name_or_id(self, data: str) -> bool:
@@ -92,27 +91,20 @@ class Streams(commands.Cog):
             return True
         return False
 
-    async def initialize(self) -> None:
+    async def cog_load(self) -> None:
         """Should be called straight after cog instantiation."""
-        await self.bot.wait_until_ready()
-
         try:
             await self.move_api_keys()
             await self.get_twitch_bearer_token()
             self.streams = await self.load_streams()
-            self.task = self.bot.loop.create_task(self._stream_alerts())
+            self.task = asyncio.create_task(self._stream_alerts())
         except Exception as error:
             log.exception("Failed to initialize Streams cog:", exc_info=error)
-
-        self._ready_event.set()
 
     @commands.Cog.listener()
     async def on_red_api_tokens_update(self, service_name, api_tokens):
         if service_name == "twitch":
             await self.get_twitch_bearer_token(api_tokens)
-
-    async def cog_before_invoke(self, ctx: commands.Context):
-        await self._ready_event.wait()
 
     async def move_api_keys(self) -> None:
         """Move the API keys from cog stored config to core bot config if they exist."""
@@ -127,6 +119,29 @@ class Streams(commands.Cog):
                 await self.bot.set_shared_api_tokens("twitch", client_id=token)
         await self.config.tokens.clear()
 
+    async def _notify_owner_about_missing_twitch_secret(self) -> None:
+        message = _(
+            "You need a client secret key if you want to use the Twitch API on this cog.\n"
+            "Follow these steps:\n"
+            "1. Go to this page: {link}.\n"
+            '2. Click "Manage" on your application.\n'
+            '3. Click on "New secret".\n'
+            "5. Copy your client ID and your client secret into:\n"
+            "{command}"
+            "\n\n"
+            "Note: These tokens are sensitive and should only be used in a private channel "
+            "or in DM with the bot."
+        ).format(
+            link="https://dev.twitch.tv/console/apps",
+            command=inline(
+                "[p]set api twitch client_id {} client_secret {}".format(
+                    _("<your_client_id_here>"), _("<your_client_secret_here>")
+                )
+            ),
+        )
+        await send_to_owners_with_prefix_replaced(self.bot, message)
+        await self.config.notified_owner_missing_twitch_secret.set(True)
+
     async def get_twitch_bearer_token(self, api_tokens: Optional[Dict] = None) -> None:
         tokens = (
             await self.bot.get_shared_api_tokens("twitch") if api_tokens is None else api_tokens
@@ -140,28 +155,8 @@ class Streams(commands.Cog):
                 if notified_owner_missing_twitch_secret is True:
                     await self.config.notified_owner_missing_twitch_secret.set(False)
             except KeyError:
-                message = _(
-                    "You need a client secret key if you want to use the Twitch API on this cog.\n"
-                    "Follow these steps:\n"
-                    "1. Go to this page: {link}.\n"
-                    '2. Click "Manage" on your application.\n'
-                    '3. Click on "New secret".\n'
-                    "5. Copy your client ID and your client secret into:\n"
-                    "{command}"
-                    "\n\n"
-                    "Note: These tokens are sensitive and should only be used in a private channel "
-                    "or in DM with the bot."
-                ).format(
-                    link="https://dev.twitch.tv/console/apps",
-                    command=inline(
-                        "[p]set api twitch client_id {} client_secret {}".format(
-                            _("<your_client_id_here>"), _("<your_client_secret_here>")
-                        )
-                    ),
-                )
                 if notified_owner_missing_twitch_secret is False:
-                    await send_to_owners_with_prefix_replaced(self.bot, message)
-                    await self.config.notified_owner_missing_twitch_secret.set(True)
+                    asyncio.create_task(self._notify_owner_about_missing_twitch_secret())
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 "https://id.twitch.tv/oauth2/token",
@@ -257,7 +252,7 @@ class Streams(commands.Cog):
         except OfflineStream:
             await ctx.send(_("That user is offline."))
         except StreamNotFound:
-            await ctx.send(_("That channel doesn't seem to exist."))
+            await ctx.send(_("That user doesn't seem to exist."))
         except InvalidTwitchCredentials:
             await ctx.send(
                 _("The Twitch token is either invalid or has not been set. See {command}.").format(
@@ -295,39 +290,78 @@ class Streams(commands.Cog):
                     return
             else:
                 embed = info
-            await ctx.send(embed=embed)
+
+            use_buttons: bool = await self.config.guild(ctx.channel.guild).use_buttons()
+            view = None
+            if use_buttons:
+                stream_url = embed.url
+                view = discord.ui.View()
+                view.add_item(
+                    discord.ui.Button(
+                        label=_("Watch the stream"), style=discord.ButtonStyle.link, url=stream_url
+                    )
+                )
+            await ctx.send(embed=embed, view=view)
 
     @commands.group()
     @commands.guild_only()
-    @checks.mod_or_permissions(manage_channels=True)
+    @commands.mod_or_permissions(manage_channels=True)
     async def streamalert(self, ctx: commands.Context):
         """Manage automated stream alerts."""
         pass
 
     @streamalert.group(name="twitch", invoke_without_command=True)
-    async def _twitch(self, ctx: commands.Context, channel_name: str):
+    async def _twitch(
+        self,
+        ctx: commands.Context,
+        channel_name: str,
+        discord_channel: Union[
+            discord.TextChannel, discord.VoiceChannel, discord.StageChannel
+        ] = commands.CurrentChannel,
+    ):
         """Manage Twitch stream notifications."""
-        await ctx.invoke(self.twitch_alert_channel, channel_name)
+        await ctx.invoke(self.twitch_alert_channel, channel_name, discord_channel)
 
     @_twitch.command(name="channel")
-    async def twitch_alert_channel(self, ctx: commands.Context, channel_name: str):
-        """Toggle alerts in this channel for a Twitch stream."""
+    async def twitch_alert_channel(
+        self,
+        ctx: commands.Context,
+        channel_name: str,
+        discord_channel: Union[
+            discord.TextChannel, discord.VoiceChannel, discord.StageChannel
+        ] = commands.CurrentChannel,
+    ):
+        """Toggle alerts in this or the given channel for a Twitch stream."""
         if re.fullmatch(r"<#\d+>", channel_name):
             await ctx.send(
                 _("Please supply the name of a *Twitch* channel, not a Discord channel.")
             )
             return
-        await self.stream_alert(ctx, TwitchStream, channel_name.lower())
+        await self.stream_alert(ctx, TwitchStream, channel_name.lower(), discord_channel)
 
     @streamalert.command(name="youtube")
-    async def youtube_alert(self, ctx: commands.Context, channel_name_or_id: str):
+    async def youtube_alert(
+        self,
+        ctx: commands.Context,
+        channel_name_or_id: str,
+        discord_channel: Union[
+            discord.TextChannel, discord.VoiceChannel, discord.StageChannel
+        ] = commands.CurrentChannel,
+    ):
         """Toggle alerts in this channel for a YouTube stream."""
-        await self.stream_alert(ctx, YoutubeStream, channel_name_or_id)
+        await self.stream_alert(ctx, YoutubeStream, channel_name_or_id, discord_channel)
 
     @streamalert.command(name="picarto")
-    async def picarto_alert(self, ctx: commands.Context, channel_name: str):
+    async def picarto_alert(
+        self,
+        ctx: commands.Context,
+        channel_name: str,
+        discord_channel: Union[
+            discord.TextChannel, discord.VoiceChannel, discord.StageChannel
+        ] = commands.CurrentChannel,
+    ):
         """Toggle alerts in this channel for a Picarto stream."""
-        await self.stream_alert(ctx, PicartoStream, channel_name)
+        await self.stream_alert(ctx, PicartoStream, channel_name, discord_channel)
 
     @streamalert.command(name="stop", usage="[disable_all=No]")
     async def streamalert_stop(self, ctx: commands.Context, _all: bool = False):
@@ -370,27 +404,32 @@ class Streams(commands.Cog):
     @streamalert.command(name="list")
     async def streamalert_list(self, ctx: commands.Context):
         """List all active stream alerts in this server."""
-        streams_list = defaultdict(list)
+        streams_list = defaultdict(lambda: defaultdict(list))
         guild_channels_ids = [c.id for c in ctx.guild.channels]
         msg = _("Active alerts:\n\n")
 
         for stream in self.streams:
             for channel_id in stream.channels:
                 if channel_id in guild_channels_ids:
-                    streams_list[channel_id].append(stream.name.lower())
+                    streams_list[channel_id][stream.platform_name].append(stream.name.lower())
 
         if not streams_list:
             await ctx.send(_("There are no active alerts in this server."))
             return
 
-        for channel_id, streams in streams_list.items():
-            channel = ctx.guild.get_channel(channel_id)
-            msg += "** - #{}**\n{}\n".format(channel, ", ".join(streams))
+        for channel_id, stream_platform in streams_list.items():
+            msg += f"- {ctx.guild.get_channel(channel_id).mention}\n"
+            for platform, streams in stream_platform.items():
+                msg += f"  - **{platform}**\n"
+                msg += f"    {humanize_list(streams)}\n"
 
         for page in pagify(msg):
             await ctx.send(page)
 
-    async def stream_alert(self, ctx: commands.Context, _class, channel_name):
+    async def stream_alert(self, ctx: commands.Context, _class, channel_name, discord_channel):
+        if isinstance(discord_channel, discord.Thread):
+            await ctx.send("Stream alerts cannot be set up in threads.")
+            return
         stream = self.get_stream(_class, channel_name)
         if not stream:
             token = await self.bot.get_shared_api_tokens(_class.token_name)
@@ -449,19 +488,19 @@ class Streams(commands.Cog):
                 return
             else:
                 if not exists:
-                    await ctx.send(_("That channel doesn't seem to exist."))
+                    await ctx.send(_("That user doesn't seem to exist."))
                     return
 
-        await self.add_or_remove(ctx, stream)
+        await self.add_or_remove(ctx, stream, discord_channel)
 
     @commands.group()
-    @checks.mod_or_permissions(manage_channels=True)
+    @commands.mod_or_permissions(manage_channels=True)
     async def streamset(self, ctx: commands.Context):
         """Manage stream alert settings."""
         pass
 
     @streamset.command(name="timer")
-    @checks.is_owner()
+    @commands.is_owner()
     async def _streamset_refresh_timer(self, ctx: commands.Context, refresh_time: int):
         """Set stream check refresh time."""
         if refresh_time < 60:
@@ -473,7 +512,7 @@ class Streams(commands.Cog):
         )
 
     @streamset.command()
-    @checks.is_owner()
+    @commands.is_owner()
     async def twitchtoken(self, ctx: commands.Context):
         """Explain how to set the twitch token."""
         message = _(
@@ -499,7 +538,7 @@ class Streams(commands.Cog):
         await ctx.maybe_send_embed(message)
 
     @streamset.command()
-    @checks.is_owner()
+    @commands.is_owner()
     async def youtubekey(self, ctx: commands.Context):
         """Explain how to set the YouTube token."""
 
@@ -680,24 +719,39 @@ class Streams(commands.Cog):
             await self.config.guild(guild).ignore_schedule.set(True)
             await ctx.send(_("Streams schedules will no longer send an alert."))
 
-    async def add_or_remove(self, ctx: commands.Context, stream):
-        if ctx.channel.id not in stream.channels:
-            stream.channels.append(ctx.channel.id)
+    @streamset.command(name="usebuttons")
+    @commands.guild_only()
+    async def use_buttons(self, ctx: commands.Context):
+        """Toggle whether to use buttons for stream alerts."""
+        guild = ctx.guild
+        current_setting: bool = await self.config.guild(guild).use_buttons()
+        if current_setting:
+            await self.config.guild(guild).use_buttons.set(False)
+            await ctx.send(_("I will no longer use buttons in stream alerts."))
+        else:
+            await self.config.guild(guild).use_buttons.set(True)
+            await ctx.send(_("I will use buttons in stream alerts."))
+
+    async def add_or_remove(self, ctx: commands.Context, stream, discord_channel):
+        if discord_channel.id not in stream.channels:
+            stream.channels.append(discord_channel.id)
             if stream not in self.streams:
                 self.streams.append(stream)
             await ctx.send(
                 _(
-                    "I'll now send a notification in this channel when {stream.name} is live."
-                ).format(stream=stream)
+                    "I'll now send a notification in the {channel.mention} channel"
+                    " when {stream.name} is live."
+                ).format(stream=stream, channel=discord_channel)
             )
         else:
-            stream.channels.remove(ctx.channel.id)
+            stream.channels.remove(discord_channel.id)
             if not stream.channels:
                 self.streams.remove(stream)
             await ctx.send(
                 _(
-                    "I won't send notifications about {stream.name} in this channel anymore."
-                ).format(stream=stream)
+                    "I won't send notifications about {stream.name}"
+                    " in the {channel.mention} channel anymore"
+                ).format(stream=stream, channel=discord_channel)
             )
 
         await self.save_streams()
@@ -740,16 +794,27 @@ class Streams(commands.Cog):
     async def _send_stream_alert(
         self,
         stream,
-        channel: discord.TextChannel,
+        channel: Union[discord.TextChannel, discord.VoiceChannel, discord.StageChannel],
         embed: discord.Embed,
         content: str = None,
         *,
         is_schedule: bool = False,
     ):
+        use_buttons: bool = await self.config.guild(channel.guild).use_buttons()
+        view = None
+        if use_buttons:
+            stream_url = embed.url
+            view = discord.ui.View()
+            view.add_item(
+                discord.ui.Button(
+                    label=_("Watch the stream"), style=discord.ButtonStyle.link, url=stream_url
+                )
+            )
         m = await channel.send(
             content,
             embed=embed,
             allowed_mentions=discord.AllowedMentions(roles=True, everyone=True),
+            view=view,
         )
         message_data = {"guild": m.guild.id, "channel": m.channel.id, "message": m.id}
         if is_schedule:
@@ -879,7 +944,7 @@ class Streams(commands.Cog):
                                 await role.edit(mentionable=False)
                         await self.save_streams()
             except Exception as e:
-                log.error("An error has occured with Streams. Please report it.", exc_info=e)
+                log.error("An error has occurred with Streams. Please report it.", exc_info=e)
 
         if to_remove:
             for stream in to_remove:
@@ -887,7 +952,10 @@ class Streams(commands.Cog):
             await self.save_streams()
 
     async def _get_mention_str(
-        self, guild: discord.Guild, channel: discord.TextChannel, guild_data: dict
+        self,
+        guild: discord.Guild,
+        channel: Union[discord.TextChannel, discord.VoiceChannel, discord.StageChannel],
+        guild_data: dict,
     ) -> Tuple[str, List[discord.Role]]:
         """Returns a 2-tuple with the string containing the mentions, and a list of
         all roles which need to have their `mentionable` property set back to False.
@@ -913,7 +981,11 @@ class Streams(commands.Cog):
                 mentions.append(role.mention)
         return " ".join(mentions), edited_roles
 
-    async def filter_streams(self, streams: list, channel: discord.TextChannel) -> list:
+    async def filter_streams(
+        self,
+        streams: list,
+        channel: Union[discord.TextChannel, discord.VoiceChannel, discord.StageChannel],
+    ) -> list:
         filtered = []
         for stream in streams:
             tw_id = str(stream["channel"]["_id"])
